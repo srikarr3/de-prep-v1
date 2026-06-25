@@ -10,23 +10,34 @@
 * **Minimal Code:**
 ```python
 import sys
+import requests
 
-# List comprehension: Loads all 1M integers into memory
-list_data = [i for i in range(1000000)]
-print(f"List Memory: {sys.getsizeof(list_data)} bytes")  # ~8MB
+# Inefficient List Approach: Loads all paginated items into a list before returning
+def fetch_all_orders_list(api_url):
+    orders = []
+    url = api_url
+    while url:
+        # Mock payload: {"results": [...], "next_url": "https://api.com/v1/orders?page=2"}
+        response = requests.get(url).json()
+        orders.extend(response.get("results", []))
+        url = response.get("next_url")
+    return orders  # Massive list loaded in RAM (can cause OOM on millions of records)
 
-# Generator expression: Lazily evaluates integers on the fly
-gen_data = (i for i in range(1000000))
-print(f"Generator Memory: {sys.getsizeof(gen_data)} bytes")  # ~112 bytes
+# Efficient Generator Approach: Yields records lazily record-by-record
+def fetch_orders_generator(api_url):
+    url = api_url
+    while url:
+        response = requests.get(url).json()
+        for record in response.get("results", []):
+            yield record  # Yields individual record, releasing memory of the page after consumption
+        url = response.get("next_url")
 
-# Function Generator
-def read_large_file(file_path):
-    with open(file_path, "r") as f:
-        for line in f:
-            yield line.strip()
+# Usage in pipeline:
+# for order in fetch_orders_generator("https://api.payments.com/v1/orders"):
+#     process_order(order)
 ```
 * **Why it Matters in Production Pipelines:**
-  * Ingesting gigabytes of API payloads or logs using lists can exhaust memory and trigger Out Of Memory (OOM) crashes. Generators allow processing infinite files or stream payloads record-by-record using constant memory.
+  * Ingesting gigabytes of API payloads, database rows, or log lines using lists can exhaust memory and trigger Out Of Memory (OOM) crashes. Generators allow processing infinite streams or file payloads record-by-record using a constant, minimal memory footprint.
 
 ---
 
@@ -36,68 +47,121 @@ def read_large_file(file_path):
 * **Minimal Code:**
 ```python
 import time
+import random
 import logging
 from functools import wraps
+import requests
 
 logging.basicConfig(level=logging.INFO)
 
-# Retry decorator for handling transient API/Network failures
-def retry(attempts=3, delay=2):
+# Retry decorator with exponential backoff and jitter for API requests
+def retry_with_backoff(max_retries=4, base_delay=2, backoff_factor=2):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            last_error = None
-            for attempt in range(1, attempts + 1):
+            delay = base_delay
+            for attempt in range(1, max_retries + 1):
                 try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    logging.warning(f"Attempt {attempt}/{attempts} failed for {func.__name__}: {e}")
-                    last_error = e
-                    time.sleep(delay)
-            raise last_error
+                    response = func(*args, **kwargs)
+                    # Raise HTTPError for bad responses to trigger retry loops on failure
+                    response.raise_for_status()
+                    return response
+                except (requests.exceptions.RequestException, Exception) as e:
+                    status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+                    
+                    if attempt == max_retries:
+                        logging.error(f"Failed after {max_retries} attempts: {e}")
+                        raise
+                    
+                    # Back off longer on 429 Rate Limit
+                    current_delay = delay * 2.5 if status_code == 429 else delay
+                    # Add random jitter to prevent synchronized retry storms
+                    jittered_delay = current_delay + random.uniform(0.1, 1.0)
+                    
+                    logging.warning(
+                        f"Attempt {attempt}/{max_retries} failed (Status: {status_code}). "
+                        f"Retrying in {jittered_delay:.2f}s... Error: {e}"
+                    )
+                    time.sleep(jittered_delay)
+                    delay *= backoff_factor
         return wrapper
     return decorator
 
 # Apply decorator to fragile connection call
-@retry(attempts=3, delay=5)
-def fetch_from_api(url):
-    # Simulating connection logic
-    return "API Data"
+@retry_with_backoff(max_retries=3, base_delay=1)
+def fetch_payments_api(endpoint):
+    return requests.get(f"https://api.razorpay.com/v1/{endpoint}")
 ```
 * **Why it Matters in Production Pipelines:**
-  * Network requests to third-party APIs or cloud database connections fail frequently. Instead of copy-pasting `try/except` loops in every function, decorators centralize retry policies and execution timing logic.
+  * Network requests to third-party APIs or cloud database connections fail frequently. Instead of copy-pasting `try/except` loops in every function, decorators centralize retry policies, exponential backoffs, and jitter calculations, keeping the core pipeline code dry.
 
 ---
 
 ## 3. Context Managers (Resource Management)
 
-* **Concept:** Context managers automate the allocation and deallocation of system resources (e.g., closing database connections or files) using the `with` statement, preventing resource leaks.
+* **Concept:** Context managers automate the allocation and deallocation of system resources (e.g., closing database connections, S3 connections, or clean-up tasks) using the `with` statement, preventing resource leaks.
 * **Minimal Code:**
 ```python
 import sqlite3
+import logging
 
-# Class-based Context Manager
-class DBConnection:
-    def __init__(self, db_path):
+class WAPTransaction:
+    """Context Manager implementing Write-Audit-Publish (WAP) pattern in database writes."""
+    def __init__(self, db_path, target_table, audit_fn):
         self.db_path = db_path
+        self.target_table = target_table
+        self.staging_table = f"staging_{target_table}"
+        self.audit_fn = audit_fn
         self.conn = None
 
     def __enter__(self):
         self.conn = sqlite3.connect(self.db_path)
-        return self.conn
+        cursor = self.conn.cursor()
+        
+        # WRITE Stage: Create staging table duplicate
+        cursor.execute(f"DROP TABLE IF EXISTS {self.staging_table}")
+        cursor.execute(f"CREATE TABLE {self.staging_table} AS SELECT * FROM {self.target_table} WHERE 1=0")
+        self.conn.commit()
+        return self.conn, self.staging_table
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.conn:
+        cursor = self.conn.cursor()
+        try:
+            if exc_type is not None:
+                # If an error happened in the block, discard staging writes and rollback
+                logging.error(f"Execution block failed. Rolling back: {exc_val}")
+                self.conn.rollback()
+                return False # Re-raise original error
+            
+            # AUDIT Stage: Execute data quality check
+            if not self.audit_fn(self.conn, self.staging_table):
+                raise ValueError("Data quality constraints violated on staging table!")
+                
+            # PUBLISH Stage: Load conformed rows into the target table
+            cursor.execute(f"INSERT INTO {self.target_table} SELECT * FROM {self.staging_table}")
             self.conn.commit()
+            logging.info("WAP Pipeline succeeded. Staged data published.")
+        except Exception as e:
+            logging.critical(f"Audit/Publish transaction aborted: {e}")
+            self.conn.rollback()
+            raise
+        finally:
+            cursor.execute(f"DROP TABLE IF EXISTS {self.staging_table}")
             self.conn.close()
 
-# Usage: Connection is automatically closed and committed, even if error occurs
-with DBConnection("app.db") as conn:
+# Validation callback function
+def check_for_null_keys(conn, table):
     cursor = conn.cursor()
-    cursor.execute("CREATE TABLE IF NOT EXISTS test (id INT)")
+    cursor.execute(f"SELECT COUNT(*) FROM {table} WHERE transaction_id IS NULL")
+    return cursor.fetchone()[0] == 0
+
+# Usage
+# with WAPTransaction("app.db", "fact_orders", check_for_null_keys) as (conn, staging_table):
+#     cursor = conn.cursor()
+#     cursor.execute(f"INSERT INTO {staging_table} VALUES (101, 'SUCCESS')")
 ```
 * **Why it Matters in Production Pipelines:**
-  * If a pipeline crashes midway through a file read or database write without closing connections, it locks tables and exhausts database connection pools, causing downstream pipeline runs to fail.
+  * If a pipeline crashes midway through a write without closing connections, it locks database tables and exhausts pool connections. Incorporating WAP checks inside custom context managers ensures that any failure automatically cleans up temporary files/tables and rolls back partial writes, preventing corrupt data from ever landing in production tables.
 
 ---
 
@@ -226,42 +290,45 @@ def run_pipeline(api_url: str, target_path: str):
 
 ---
 
-## 8. Configuration Management
+## 8. Pipeline Configuration Management with Pydantic
 
-* **Concept:** Decoupling environments, database credentials, and file paths from execution logic by using external configuration managers or environment variables.
+* **Concept:** Decoupling execution parameters, database connections, and path directories from code using Pydantic settings management. This validates pipeline variables (like batch sizes, port ranges, paths, and date patterns) at startup, preventing mid-run failures.
 * **Minimal Code:**
 ```python
 import os
-import json
+from typing import Literal
+from pydantic import Field, HttpUrl
+from pydantic_settings import BaseSettings
 
-# Setup Environment variables (Simulating system environment setup)
-os.environ["PIPELINE_ENV"] = "PROD"
-os.environ["DB_PORT"] = "5432"
+# Setup temporary environment variables
+os.environ["ENV"] = "production"
+os.environ["DB_PASSWORD"] = "secure-pass-123"
+os.environ["SLACK_WEBHOOK"] = "https://hooks.slack.com/services/T00/B00/X00"
+os.environ["BATCH_SIZE"] = "5000"
 
-# Configuration loader
-class Config:
-    def __init__(self):
-        self.env = os.getenv("PIPELINE_ENV", "DEV")
-        self.db_port = int(os.getenv("DB_PORT", "5432"))
-        
-        # Load environment-specific file directories
-        config_file = f"config.{self.env.lower()}.json"
-        if os.path.exists(config_file):
-            with open(config_file, "r") as f:
-                self.settings = json.load(f)
-        else:
-            self.settings = {"landing_bucket": "s3://dev-landing-zone/"}
+class PipelineConfig(BaseSettings):
+    env: Literal["development", "staging", "production"] = Field(..., alias="ENV")
+    db_host: str = Field("localhost", alias="DB_HOST")
+    db_port: int = Field(5432, alias="DB_PORT")
+    db_password: str = Field(..., alias="DB_PASSWORD")
+    
+    batch_size: int = Field(1000, alias="BATCH_SIZE")
+    s3_landing_bucket: str = Field("s3://dev-landing-bucket/", alias="S3_LANDING_BUCKET")
+    slack_webhook: HttpUrl = Field(..., alias="SLACK_WEBHOOK")
 
-    @property
-    def landing_bucket(self):
-        return self.settings.get("landing_bucket")
+    # Pydantic loads configuration automatically from environment variables
+    class Config:
+        populate_by_name = True
 
-# Load configuration instance
-config = Config()
-print(f"Active Env: {config.env}, Target Bucket: {config.landing_bucket}")
+# Instantiate config
+try:
+    config = PipelineConfig()
+    print(f"Pipeline Config Loaded: env={config.env}, port={config.db_port}, batch_size={config.batch_size}")
+except Exception as e:
+    print(f"Configuration Loading Failed: {e}")
 ```
 * **Why it Matters in Production Pipelines:**
-  * Hardcoding database hosts, folder locations, and API keys directly in pipeline code violates security policies and makes moving code between Development, Staging, and Production environments difficult.
+  * Hardcoding settings or reading environment variables using raw `os.getenv` doesn't enforce types or check for missing credentials. A Pydantic settings schema acts as a data contract for your infrastructure, failing fast during pipeline initialization before connecting to databases or starting heavy clusters.
 
 ---
 

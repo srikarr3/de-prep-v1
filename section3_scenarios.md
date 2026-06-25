@@ -346,3 +346,46 @@
   * Trying to write raw Kafka streams into Elasticsearch or standard MySQL at 50k events/sec (causes write bottlenecks and index-heap crashes).
   * Doing all calculations on read (e.g., `SELECT SUM(amount)...`) rather than utilizing pre-aggregated materialized views on write.
 
+---
+
+## Scenario 19: Design a payment audit trail pipeline with absolute integrity and zero data loss
+* **The Interviewer's Question:** *"Design a payment audit trail pipeline. Every payment state change (INITIATED, SUCCESS, FAILED, REFUNDED) must be captured, archived, and queryable for audits. We require absolute data integrity, zero data loss, exact-once processing, and a tamper-proof audit log. How would you design this?"*
+* **What they are testing:**
+  - Ensuring zero data loss (relying on transactional write guarantees, WAL, Kafka configuration: `acks=all`, replication factor).
+  - Exactly-once processing semantics (Kafka transactional API, Spark structured streaming with idempotent writes, or write-ahead logs).
+  - Audit trail immutable design (append-only storage, digital signatures, hashing/chaining, WORM storage e.g. Amazon Glacier/S3 Object Lock).
+  - Reconciliation mechanisms (detecting discrepancies between transactional state and audit logs).
+* **Structured Step-by-Step Approach:**
+  1. **Source / Producer Config:** Payment services publish transition events to a Kafka topic. Ensure the producer uses `acks=all`, `enable.idempotence=true`, and a replication factor of at least 3. Use schema validation (Avro/Protobuf) via Schema Registry to prevent structural regressions.
+  2. **Streaming / Processing Layer:** Run a Spark Structured Streaming or Flink job with checkpointing enabled to an ACID storage (like S3/ADLS). Set up checkpointing with transactional target writes (e.g. Delta Lake/Iceberg).
+  3. **Storage / Immutable Ledger Layer:**
+     - Target storage is a Delta Table or Iceberg Table configured on a bucket with **S3 Object Lock (WORM - Write Once Read Many)** in Compliance mode. This prevents any deletion or modification of audit files, even by root/admin accounts.
+     - Leverage Delta Lake's append-only constraint (`tblproperties('delta.appendOnly' = 'true')`) to enforce that only inserts are allowed.
+  4. **Reconciliation / Audit Loop:** Run a daily batch job that reconciles the count and checksums of transactions in the operational Postgres DB with the records in the immutable audit lake. Flag any anomalies (e.g. missing transactions, state mismatches) to an Ops dashboard.
+* **Common Mistakes:**
+  - Using a standard relational database with updates to the same row for audit trails (defeats immutability; audit trails must be an append-only event stream).
+  - Leaving Kafka producer config at defaults (`acks=1` or `acks=0`), which allows data loss if a broker crashes before replicating.
+  - Allowing direct file deletion permissions on the cloud storage folder hosting the audit logs (fails compliance; requires WORM / Object Lock).
+
+---
+
+## Scenario 20: Design a cost-efficient backfill system for historical data at scale
+* **The Interviewer's Question:** *"We have 3 years of raw clickstream logs in S3 (uncompressed, JSON format, ~500TB) and need to reprocess them through a new Spark pipeline to populate a new aggregated dimension table. Running this on a standard production cluster will blow up our monthly cloud budget. How would you design a cost-efficient, resilient backfill system?"*
+* **What they are testing:**
+  - Cost-optimization strategies (Spot instances vs On-demand, cloud storage tiering, data format optimizations).
+  - Rate-limiting downstream writes (avoiding overloading target DWs/databases like RDS or DynamoDB).
+  - Cluster configuration (Auto-scaling, Spark execution profiles, dynamic allocation).
+  - Resiliency and progress tracking (checkpointing, avoiding re-running completed batches if a cluster fails mid-run).
+* **Structured Step-by-Step Approach:**
+  1. **Data Pre-flight Analysis & Tiering:** Check raw log structure. If archived, restore logs to a hot/cool tier. Process in parallel chunks rather than one giant window.
+  2. **Compute Strategy (Spot Instances & Cluster Sizing):** Use transient clusters (e.g., AWS EMR or Databricks job clusters) configured with a small On-demand Master/Driver node (to prevent driver loss crashes) and 100% **Spot instances** for Core/Task executor nodes. This reduces compute costs by up to 90%.
+  3. **State Management & Checkpointing (Idempotent Batches):** Use a control table (e.g., in DynamoDB or PostgreSQL) to track backfill progress by day/hour partitions. The pipeline checks the status table, picks up unprocessed partitions, and marks them as `RUNNING` then `SUCCESS`. If a Spot instance reclaim causes a worker node to drop and the job fails, the pipeline can resume from the last failed partition, preventing costly double-processing.
+  4. **Dynamic Scaling & Serialization Options:** Use optimized formats like Parquet/ORC for reading if available; if raw JSON, enforce schema at read time to avoid expensive schema inference. Configure Spark to use `KryoSerializer` and tune partition size to around 128MB.
+  5. **Downstream Rate Limiting:** If writing to an operational database (e.g. DynamoDB/RDS), implement rate-limiting or write-throttling in the Spark job to avoid triggering database capacity auto-scaling or knocking down online transaction services.
+* **Common Mistakes:**
+  - Running a single monolithic job for the entire 3 years (if it crashes at 95% complete, you have to restart from scratch, wasting thousands of dollars).
+  - Using 100% Spot instances including the Driver node (if the Driver node gets reclaimed, the entire job terminates).
+  - Using on-demand instances for heavy task nodes when Spot instances can do the exact same batch processing for a fraction of the cost.
+  - Forgetting to throttle writes to the downstream database, which causes database CPU spikes and API throttling for the production app.
+
+

@@ -28,5 +28,14 @@ This preparation guide is organized into the following sections. Select any sect
 8. **Section 8: Rapid-Fire Definitions (The "Quick, What Is..." Round)**
    * *Key Topics: 55 rapid-fire big data terms (e.g. Hive metastore, compaction, tombstoning, data serialization, schema drift).*
    
-9. **Section 9: Top 15 Most Asked DE Interview Questions at Indian Product Companies**
+9. **Section 9: Top 17 Most Asked DE Interview Questions at Indian Product Companies**
    * *Key Topics: Real interview questions from Razorpay, PhonePe, CRED, Flipkart, Swiggy (e.g., API rate limiting, exponential partition growth).*
+
+10. **Section 10: dbt (Data Build Tool) Must-Knows**
+    * *Key Topics: Models & materializations (View, Table, Incremental, Ephemeral), Sources vs Refs, schema and singular testing, Snapshots (SCD Type 2), incremental strategies.*
+
+11. **Section 11: Apache Airflow Must-Knows**
+    * *Key Topics: DAGs/Tasks, Operators vs Sensors, TaskFlow API decorators, scheduling interval/logical date execution, Catchup vs Backfill, task groups.*
+
+12. **Section 12: Databricks & Delta Lake Must-Knows**
+    * *Key Topics: Lakehouse/Medallion layout, JSON transaction logs, Time Travel, OPTIMIZE/VACUUM/Z-Ordering, Unity Catalog (managed vs external tables), Liquid Clustering.*
